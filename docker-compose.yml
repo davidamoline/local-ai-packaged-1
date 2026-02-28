@@ -1,8 +1,15 @@
 include:
   - ./supabase/docker/docker-compose.yml
 
+networks:
+  default:
+    name: localai_default
+    external: true
+
 volumes:
   n8n_storage:
+  litellm_data:
+  openclaw_config:
   ollama_storage:
   qdrant_storage:
   open-webui:
@@ -19,7 +26,7 @@ x-n8n: &service-n8n
   image: n8nio/n8n:latest
   environment:
     - DB_TYPE=postgresdb
-    - DB_POSTGRESDB_HOST=db
+    - DB_POSTGRESDB_HOST=postgres
     - DB_POSTGRESDB_USER=postgres
     - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
     - DB_POSTGRESDB_DATABASE=postgres
@@ -28,8 +35,15 @@ x-n8n: &service-n8n
     - N8N_ENCRYPTION_KEY
     - N8N_USER_MANAGEMENT_JWT_SECRET
     - WEBHOOK_URL=${N8N_HOSTNAME:+https://}${N8N_HOSTNAME:-http://localhost:5678}
-    # Uncomment to enable LocalFileTrigger and ExecuteCommand nodes (disabled by default in n8n v2+)
-    # - NODES_EXCLUDE=[]
+    - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    - SERPAPI_KEY=${SERPAPI_KEY}
+    - HUNTER_API_KEY=${HUNTER_API_KEY}
+    - TRISKE_API_URL=${TRISKE_API_URL}
+    - TRISKE_API_KEY=${TRISKE_API_KEY}
+    - TRISKE_PIPELINE_ID=${TRISKE_PIPELINE_ID}
+    - TRISKE_FIRST_STAGE_ID=${TRISKE_FIRST_STAGE_ID}
+    - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+    - N8N_RESTRICT_FILE_ACCESS_TO=/data/content;/data/shared;/backup
 
 x-ollama: &service-ollama
   image: ollama/ollama:latest
@@ -53,7 +67,7 @@ x-init-ollama: &init-ollama
   entrypoint: /bin/sh
   command:
     - "-c"
-    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull qwen2.5:7b-instruct-q4_K_M; OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text"
+    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull qwen2.5:32b-instruct; OLLAMA_HOST=ollama:11434 ollama pull qwen2.5:7b-instruct-q4_K_M; OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text"
 
 services:
   flowise:
@@ -63,14 +77,70 @@ services:
     expose:
       - 3001/tcp
     environment:
-        - PORT=3001
-        - FLOWISE_USERNAME=${FLOWISE_USERNAME}
-        - FLOWISE_PASSWORD=${FLOWISE_PASSWORD}
+      - PORT=3001
+      - FLOWISE_USERNAME=${FLOWISE_USERNAME}
+      - FLOWISE_PASSWORD=${FLOWISE_PASSWORD}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-        - ~/.flowise:/root/.flowise
+      - flowise:/root/.flowise
     entrypoint: /bin/sh -c "sleep 3; flowise start"
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main
+    container_name: litellm
+    restart: unless-stopped
+    expose:
+      - 4000/tcp
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+      - litellm_data:/app/data
+    entrypoint: ["litellm"]
+    command:
+      - --config
+      - /app/config.yaml
+      - --port
+      - "4000"
+      - --host
+      - 0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health')\""]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 15s
+
+  openclaw-gateway:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    user: root
+    volumes:
+      - openclaw_config:/home/node/.openclaw
+      - ./openclaw/install-skills.sh:/docker-entrypoint-skills.sh:ro
+      - ./openclaw/SKILL.md:/docker-entrypoint-skill.md:ro
+      - ./openclaw/workspace:/docker-entrypoint-workspace:ro
+    entrypoint: ["/bin/sh", "/docker-entrypoint-skills.sh"]
+    environment:
+      - OPENCLAW_HOSTNAME=openclaw.lan
+      - OPENCLAW_PORT=18789
+      - OPENCLAW_BIND=0.0.0.0
+      - OPENAI_BASE_URL=http://ollama:11434/v1
+      - OPENAI_API_KEY=unused
+      - OPENCLAW_GATEWAY_TOKEN=local-dev-token
+    depends_on:
+      - litellm
+    command: ["node", "/app/openclaw.mjs", "gateway", "--port", "18789", "--bind", "lan", "--allow-unconfigured"]
+
+  openclaw-cli:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw-cli
+    entrypoint: ["/bin/sh","-lc"]
+    command: ["sleep infinity"]
+    volumes:
+      - openclaw_config:/home/node/.openclaw
+    depends_on:
+      - openclaw-gateway
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
@@ -82,6 +152,19 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - open-webui:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - USE_OLLAMA_DOCKER=true
+
+  n8n-import:
+    <<: *service-n8n
+    container_name: n8n-import
+    entrypoint: /bin/sh
+    command:
+      - "-c"
+      - "n8n import:credentials --separate --input=/backup/credentials && n8n import:workflow --separate --input=/backup/workflows"
+    volumes:
+      - ./n8n/backup:/backup
 
   n8n:
     <<: *service-n8n
@@ -89,10 +172,13 @@ services:
     restart: unless-stopped
     expose:
       - 5678/tcp
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - n8n_storage:/home/node/.n8n
       - ./n8n/backup:/backup
       - ./shared:/data/shared
+      - /mnt/c/Users/david/solas-ai/content:/data/content
 
   qdrant:
     image: qdrant/qdrant
@@ -106,18 +192,18 @@ services:
 
   neo4j:
     image: neo4j:latest
+    restart: unless-stopped
     volumes:
-        - ./neo4j/logs:/logs
-        - ./neo4j/config:/config
-        - ./neo4j/data:/data
-        - ./neo4j/plugins:/plugins
+      - ./neo4j/logs:/logs
+      - ./neo4j/config:/config
+      - ./neo4j/data:/data
+      - ./neo4j/plugins:/plugins
     expose:
       - 7473/tcp
       - 7474/tcp
       - 7687/tcp
     environment:
-        - NEO4J_AUTH=${NEO4J_AUTH:-"neo4j/your_password"}
-    restart: always
+      - NEO4J_AUTH=${NEO4J_AUTH:-"neo4j/your_password"}
 
   caddy:
     container_name: caddy
@@ -137,15 +223,17 @@ services:
       - caddy-data:/data:rw
       - caddy-config:/config:rw
     environment:
-      - N8N_HOSTNAME=${N8N_HOSTNAME:-":8001"}
-      - WEBUI_HOSTNAME=${WEBUI_HOSTNAME:-":8002"}
-      - FLOWISE_HOSTNAME=${FLOWISE_HOSTNAME:-":8003"}
-      - OLLAMA_HOSTNAME=${OLLAMA_HOSTNAME:-":8004"}
-      - SUPABASE_HOSTNAME=${SUPABASE_HOSTNAME:-":8005"}
-      - SEARXNG_HOSTNAME=${SEARXNG_HOSTNAME:-":8006"}
-      - LANGFUSE_HOSTNAME=${LANGFUSE_HOSTNAME:-":8007"}
-      - NEO4J_HOSTNAME=${NEO4J_HOSTNAME:-":8008"}
-      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-internal}
+      - N8N_HOSTNAME=n8n.lan
+      - WEBUI_HOSTNAME=webui.lan
+      - FLOWISE_HOSTNAME=flowise.lan
+      - LITELLM_HOSTNAME=litellm.lan
+      - SUPABASE_HOSTNAME=supabase.lan
+      - LANGFUSE_HOSTNAME=langfuse.lan
+      - NEO4J_HOSTNAME=neo4j.lan
+      - SEARXNG_HOSTNAME=searxng.lan
+      - LETSENCRYPT_EMAIL=internal@lan
+      - OPENCLAW_HOSTNAME=openclaw.lan
+      - OPENCLAW_GATEWAY_TOKEN=local-dev-token
     cap_drop:
       - ALL
     cap_add:
@@ -153,12 +241,12 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "1m"
-        max-file: "1"
+        max-size: "10m"
+        max-file: "3"
 
   langfuse-worker:
     image: langfuse/langfuse-worker:3
-    restart: always
+    restart: unless-stopped
     depends_on: &langfuse-depends-on
       postgres:
         condition: service_healthy
@@ -171,7 +259,7 @@ services:
     expose:
      - 3030/tcp
     environment: &langfuse-worker-env
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/langfuse
       SALT: ${LANGFUSE_SALT}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
@@ -192,7 +280,7 @@ services:
       LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
       LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
       LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://minio:9000}
       LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
       LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
       LANGFUSE_S3_BATCH_EXPORT_ENABLED: ${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-false}
@@ -200,7 +288,7 @@ services:
       LANGFUSE_S3_BATCH_EXPORT_PREFIX: ${LANGFUSE_S3_BATCH_EXPORT_PREFIX:-exports/}
       LANGFUSE_S3_BATCH_EXPORT_REGION: ${LANGFUSE_S3_BATCH_EXPORT_REGION:-auto}
       LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_ENDPOINT:-http://minio:9000}
-      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT:-http://minio:9000}
       LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: ${LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID:-minio}
       LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: ${LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE:-true}
@@ -216,13 +304,13 @@ services:
 
   langfuse-web:
     image: langfuse/langfuse:3
-    restart: always
+    restart: unless-stopped
     depends_on: *langfuse-depends-on
     expose:
       - 3000/tcp
     environment:
       <<: *langfuse-worker-env
-      NEXTAUTH_URL: http://localhost:3002
+      NEXTAUTH_URL: https://langfuse.lan
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
       LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
       LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
@@ -236,7 +324,7 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server
-    restart: always
+    restart: unless-stopped
     user: "101:101"
     expose:
       - 8123/tcp
@@ -258,7 +346,7 @@ services:
 
   minio:
     image: minio/minio
-    restart: always
+    restart: unless-stopped
     entrypoint: sh
     # create the 'langfuse' bucket before starting the service
     command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
@@ -282,8 +370,8 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 3s
-      timeout: 3s
+      interval: 5s
+      timeout: 5s
       retries: 10
     expose:
       - 5432/tcp
@@ -315,7 +403,7 @@ services:
         max-size: "1m"
         max-file: "1"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 3s
       timeout: 10s
       retries: 10
